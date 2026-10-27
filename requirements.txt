@@ -1,0 +1,7 @@
+streamlit
+pandas
+numpy
+networkx
+matplotlib
+altair
+ifcopenshell
