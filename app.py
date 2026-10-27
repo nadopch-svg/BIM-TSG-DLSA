@@ -31,10 +31,13 @@ import math
 import os
 import random
 import re
+import subprocess
+import sys
 import tempfile
 import time
 import unicodedata
 from datetime import date, datetime
+from pathlib import Path
 
 import networkx as nx
 import numpy as np
@@ -1413,6 +1416,78 @@ def render_schedule_tab(proj, cal, status_day):
     base["Start_date"], base["Finish_date"] = day_to_date(cal, base["Start_day"]), day_to_date(cal, base["Finish_day"] - 1)
     b2.download_button(f"⬇️ {base_name}", base.to_csv(index=False).encode("utf-8-sig"),
                        file_name=base_name, mime="text/csv")
+
+    # ── Bexel용 MS Project XML 내보내기 (csv_to_mspdi.py 자동 실행) ──
+    st.divider()
+    st.markdown("##### 📤 Bexel 내보내기")
+    local = os.name == "nt"  # 내 Windows PC에서 실행 중일 때만 C:\URP\out에 직접 저장 가능
+    if local:
+        st.caption(f"현재 공정표를 MS Project XML로 변환해 `{BEXEL_OUT_DIR}\\{BEXEL_XML_STEM}.xml`에 저장합니다 "
+                   "(같은 이름 파일은 덮어씀).")
+        if st.button(f"📤 {BEXEL_OUT_DIR}에 XML 저장", key="bexel_xml_btn"):
+            with st.spinner("csv_to_mspdi.py 실행 중…"):
+                ok, msg, _ = export_bexel_xml(view, Path(BEXEL_OUT_DIR))
+            st.session_state["bexel_xml_result"] = (ok, msg)
+    else:
+        st.caption("웹 배포 버전은 내 PC 폴더에 직접 쓸 수 없습니다. XML을 만든 뒤 내려받아 "
+                   f"`{BEXEL_OUT_DIR}`에 `{BEXEL_XML_STEM}.xml`로 넣어 주세요.")
+        if st.button("📤 Bexel용 XML 만들기", key="bexel_xml_btn"):
+            with st.spinner("csv_to_mspdi.py 실행 중…"):
+                with tempfile.TemporaryDirectory() as td:
+                    ok, msg, xml = export_bexel_xml(view, Path(td))
+            st.session_state["bexel_xml_result"] = (ok, msg)
+            st.session_state["bexel_xml_bytes"] = xml
+    res = st.session_state.get("bexel_xml_result")
+    if res:
+        (st.success if res[0] else st.error)(res[1])
+    if not local and st.session_state.get("bexel_xml_bytes"):
+        st.download_button(f"⬇️ {BEXEL_XML_STEM}.xml", st.session_state["bexel_xml_bytes"],
+                           file_name=f"{BEXEL_XML_STEM}.xml", mime="application/xml", type="primary")
+
+
+BEXEL_OUT_DIR = r"C:\URP\out"
+BEXEL_XML_STEM = "DLSA_Dense"
+
+
+def export_bexel_xml(view: pd.DataFrame, out_dir: Path) -> tuple[bool, str, bytes | None]:
+    """공정표 DataFrame → 임시 CSV → csv_to_mspdi.py → <out_dir>/DLSA_Dense.xml.
+    (성공 여부, 메시지(Bexel 검증 기준값 포함), XML 바이트)를 돌려준다."""
+    script = Path(__file__).resolve().parent / "csv_to_mspdi.py"
+    if not script.exists():
+        return False, f"csv_to_mspdi.py를 찾지 못했습니다: {script}", None
+    if view.empty:
+        return False, "공정표가 비어 있어 내보낼 수 없습니다.", None
+    out_dir.mkdir(parents=True, exist_ok=True)
+    start = pd.to_datetime(view["Start_date"]).min().date().isoformat()
+    with tempfile.TemporaryDirectory() as td:
+        csv_path = Path(td) / "DLSA_Schedule.csv"
+        view.to_csv(csv_path, index=False, encoding="utf-8-sig")
+        cmd = [sys.executable, str(script), str(csv_path), "--start", start,
+               "--duration-col", "Duration_d", "--out", str(out_dir / BEXEL_XML_STEM)]
+        try:
+            r = subprocess.run(cmd, capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=300)
+        except subprocess.TimeoutExpired:
+            return False, "변환이 5분 안에 끝나지 않았습니다.", None
+    log = "\n".join(s for s in (r.stdout.strip(), r.stderr.strip()) if s)
+    if r.returncode != 0:
+        return False, f"변환 실패 (exit {r.returncode})\n\n```\n{log}\n```", None
+
+    # 생성된 XML에서 검증 기준값 추출
+    import xml.etree.ElementTree as ET
+    ns = {"p": "http://schemas.microsoft.com/project"}
+    xml_path = out_dir / f"{BEXEL_XML_STEM}.xml"
+    root = ET.parse(xml_path).getroot()
+    tasks = [t for t in root.findall(".//p:Task", ns) if t.findtext("p:UID", "", ns) != "0"]
+    n_links = len(root.findall(".//p:PredecessorLink", ns))
+    first, last = tasks[0].findtext("p:Name", "", ns), tasks[-1].findtext("p:Name", "", ns)
+    s = min(t.findtext("p:Start", "", ns) for t in tasks)[:10]
+    f = max(t.findtext("p:Finish", "", ns) for t in tasks)[:10]
+    head = f"저장 완료: `{xml_path}`" if os.name == "nt" else "XML 생성 완료 — 아래 버튼으로 내려받으세요."
+    return True, (f"{head}\n\n"
+                  f"- 작업 {len(tasks)}개 (`{first}` ~ `{last}`), 관계 {n_links}개\n"
+                  f"- 기간 {s} ~ {f}\n\n"
+                  f"Claude에게: **Bexel에 DLSA 스케줄 가져와 줘. 기준값은 작업 {len(tasks)}개, "
+                  f"{first.replace('DLSA_', '')}–{last.replace('DLSA_', '')}, 관계 {n_links}개, 기간 {s}~{f}.**"), xml_path.read_bytes()
 
 
 def render_chart_tab(proj, cal):
